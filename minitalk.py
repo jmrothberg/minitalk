@@ -33,10 +33,8 @@ DEFAULT_TRANSFORMERS = os.path.expanduser(
 DEFAULT_MODEL_NAME = "MiniCPM5-2B-NF4"
 # Logical default when a model config has no max_position_embeddings.
 DEFAULT_MODEL_WINDOW = 262144  # 256k
-SYSTEM_PROMPT = (
-    "You are MiniTalk, a helpful assistant running locally on a Jetson Orin Nano Super. "
-    "Answer clearly and keep replies concise unless the user asks for detail."
-)
+# Short on purpose: long system prompts waste prefill tokens on a 2B/8GB box.
+SYSTEM_PROMPT = "You are Eliza, a warm psychiatrist and supportive listener. Keep replies short."
 # Keep this many recent messages (user+assistant) after compaction.
 COMPACT_KEEP_RECENT = 4
 # Compact early enough to leave room for the next turn (Bud ContextCompact / CompactionBench).
@@ -154,10 +152,9 @@ class Kernel:
             if rc == 0:
                 y_ptr.reshape(-1)[:] = flat
                 return
-            # One failed launch → stay on CPU for the rest of the session.
+            # Keep GPU enabled; fall back for this op only (cache miss/OOM is transient).
             self.gpu_note = (self.cuda.cuda_nf4_last_error() or b"cuda launch failed").decode()
-            self.cuda = None
-            self.backend = "cpu"
+            self.backend = "cuda+cpu"
         rc = self.lib.nf4_linear(
             packed.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8)),
             scales.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),

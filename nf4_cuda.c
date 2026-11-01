@@ -41,7 +41,10 @@ typedef struct {
     size_t bytes;
 } GpuBuf;
 
-#define MAX_BUFS 512
+/* 42 layers × 7 mats × (packed+scales+code) needs >512 slots; was overflowing
+ * and MiniTalk then permanently fell back to CPU (~1.4 tok/s). */
+#define MAX_BUFS 2048
+#define MAX_CACHE_BYTES (512ull * 1024ull * 1024ull)
 
 static struct {
     void *lib;
@@ -63,6 +66,11 @@ static struct {
     CUfunction kn;
     GpuBuf bufs[MAX_BUFS];
     int nbufs;
+    size_t cache_bytes;
+    CUdeviceptr scratch_x;
+    CUdeviceptr scratch_y;
+    size_t scratch_x_bytes;
+    size_t scratch_y_bytes;
     int ready;
     char err[512];
 } G;
@@ -161,20 +169,44 @@ static int load_syms(void) {
     return 0;
 }
 
+static void cache_evict_one(void) {
+    /* Drop oldest entry (FIFO). Enough to keep decode on-GPU under 8GB. */
+    if (G.nbufs <= 0) {
+        return;
+    }
+    G.cuMemFree(G.bufs[0].device);
+    if (G.cache_bytes >= G.bufs[0].bytes) {
+        G.cache_bytes -= G.bufs[0].bytes;
+    } else {
+        G.cache_bytes = 0;
+    }
+    memmove(&G.bufs[0], &G.bufs[1], (size_t)(G.nbufs - 1) * sizeof(GpuBuf));
+    G.nbufs--;
+}
+
 static CUdeviceptr cache_upload(const void *host, size_t bytes) {
     int i;
     CUresult rc;
     CUdeviceptr d = 0;
     for (i = 0; i < G.nbufs; i++) {
         if (G.bufs[i].host_key == host && G.bufs[i].bytes == bytes) {
-            return G.bufs[i].device;
+            /* Touch: move to end so hot weights survive eviction. */
+            if (i != G.nbufs - 1) {
+                GpuBuf tmp = G.bufs[i];
+                memmove(&G.bufs[i], &G.bufs[i + 1], (size_t)(G.nbufs - 1 - i) * sizeof(GpuBuf));
+                G.bufs[G.nbufs - 1] = tmp;
+            }
+            return G.bufs[G.nbufs - 1].device;
         }
     }
-    if (G.nbufs >= MAX_BUFS) {
-        snprintf(G.err, sizeof(G.err), "gpu buffer cache full");
-        return 0;
+    while ((G.nbufs >= MAX_BUFS || G.cache_bytes + bytes > MAX_CACHE_BYTES) && G.nbufs > 0) {
+        cache_evict_one();
     }
     rc = G.cuMemAlloc(&d, bytes);
+    while (rc != CUDA_SUCCESS && G.nbufs > 0) {
+        cache_evict_one();
+        rc = G.cuMemAlloc(&d, bytes);
+    }
     if (rc != CUDA_SUCCESS) {
         set_err(rc, "cuMemAlloc");
         return 0;
@@ -189,7 +221,28 @@ static CUdeviceptr cache_upload(const void *host, size_t bytes) {
     G.bufs[G.nbufs].device = d;
     G.bufs[G.nbufs].bytes = bytes;
     G.nbufs++;
+    G.cache_bytes += bytes;
     return d;
+}
+
+static CUdeviceptr scratch_alloc(CUdeviceptr *slot, size_t *have, size_t need) {
+    CUresult rc;
+    if (*slot && *have >= need) {
+        return *slot;
+    }
+    if (*slot) {
+        G.cuMemFree(*slot);
+        *slot = 0;
+        *have = 0;
+    }
+    rc = G.cuMemAlloc(slot, need);
+    if (rc != CUDA_SUCCESS) {
+        set_err(rc, "cuMemAlloc scratch");
+        *slot = 0;
+        return 0;
+    }
+    *have = need;
+    return *slot;
 }
 
 int cuda_nf4_init(void) {
@@ -266,14 +319,14 @@ int cuda_nf4_linear(const uint8_t *packed, const float *scales, const float *x, 
     if (!d_packed || !d_scales || !d_code) {
         return 1;
     }
-    if ((rc = G.cuMemAlloc(&d_x, x_n)) != CUDA_SUCCESS ||
-        (rc = G.cuMemAlloc(&d_y, y_n)) != CUDA_SUCCESS) {
-        set_err(rc, "cuMemAlloc x/y");
-        goto fail;
+    d_x = scratch_alloc(&G.scratch_x, &G.scratch_x_bytes, x_n);
+    d_y = scratch_alloc(&G.scratch_y, &G.scratch_y_bytes, y_n);
+    if (!d_x || !d_y) {
+        return 1;
     }
     if ((rc = G.cuMemcpyHtoD(d_x, x, x_n)) != CUDA_SUCCESS) {
         set_err(rc, "cuMemcpyHtoD x");
-        goto fail;
+        return 1;
     }
     args[0] = &d_packed;
     args[1] = &d_scales;
@@ -285,23 +338,15 @@ int cuda_nf4_linear(const uint8_t *packed, const float *scales, const float *x, 
     rc = G.cuLaunchKernel(G.kn, (unsigned)rows, 1, 1, 128, 1, 1, 0, NULL, args, NULL);
     if (rc != CUDA_SUCCESS) {
         set_err(rc, "cuLaunchKernel");
-        goto fail;
+        return 1;
     }
     if ((rc = G.cuCtxSynchronize()) != CUDA_SUCCESS) {
         set_err(rc, "cuCtxSynchronize");
-        goto fail;
+        return 1;
     }
     if ((rc = G.cuMemcpyDtoH(y, d_y, y_n)) != CUDA_SUCCESS) {
         set_err(rc, "cuMemcpyDtoH");
-        goto fail;
+        return 1;
     }
-    G.cuMemFree(d_x);
-    G.cuMemFree(d_y);
     return 0;
-fail:
-    if (d_x)
-        G.cuMemFree(d_x);
-    if (d_y)
-        G.cuMemFree(d_y);
-    return 1;
 }
