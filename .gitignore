@@ -1,0 +1,11 @@
+.pydeps/
+.venv/
+__pycache__/
+*.pyc
+*.so
+.cuda_debs/
+.cuda_local/
+*.egg-info/
+.DS_Store
+.idea/
+.vscode/
