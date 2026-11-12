@@ -716,7 +716,6 @@ class ChatEngine:
         ids = self._prompt_ids()
         # Each turn rebuilds the cache from the full prompt. Context stays short on purpose.
         self.model.cache_len = 0
-        started = time.perf_counter()
         if on_status:
             on_status(f"prefill {len(ids)} tokens")
         logits = self.model.forward(ids, progress=lambda _p, detail: on_status and on_status(f"prefill {detail}"), stop=stop)
@@ -750,9 +749,7 @@ class ChatEngine:
             self.messages.pop()
             return ""
         self.messages.append({"role": "assistant", "content": text})
-        if on_status:
-            elapsed = time.perf_counter() - started
-            on_status(f"done {len(produced)} tok in {elapsed:.1f}s")
+        # Leave the last tok/s line on the HUD. Do not replace it with "done".
         return text
 
 
@@ -959,16 +956,472 @@ def self_test():
     print("self-test ok")
 
 
+def find_llama_bin():
+    """In-process companion: llama-completion built for this Orin (not a server)."""
+    path = os.path.join(ROOT, ".llama.cpp", "build", "bin", "llama-completion")
+    if os.path.isfile(path) and os.access(path, os.X_OK):
+        return path
+    return None
+
+
+def list_switchable_models(transformers_dir):
+    """GGUF files MiniTalk can swap to without leaving the chat. One row per file."""
+    found = []
+    seen = set()
+    if not os.path.isdir(transformers_dir):
+        return found
+
+    def add(path):
+        if not path or not os.path.isfile(path) or not path.endswith(".gguf"):
+            return
+        ap = os.path.abspath(path)
+        if ap in seen:
+            return
+        seen.add(ap)
+        try:
+            size_gb = os.path.getsize(ap) / (1024 ** 3)
+        except OSError:
+            size_gb = 0.0
+        found.append(
+            {
+                "name": os.path.splitext(os.path.basename(ap))[0],
+                "gguf": ap,
+                "size_gb": size_gb,
+                "template": template_for_gguf(ap, transformers_dir),
+            }
+        )
+
+    for name in sorted(os.listdir(transformers_dir)):
+        folder = os.path.join(transformers_dir, name)
+        if os.path.isdir(folder):
+            try:
+                names = sorted(os.listdir(folder))
+            except OSError:
+                names = []
+            # Prefer Q4_K_M when a folder has several quants. It is the fast Orin default.
+            ggufs = [n for n in names if n.endswith(".gguf")]
+            preferred = [n for n in ggufs if "Q4_K_M" in n or "q4_k_m" in n]
+            pick = preferred or ggufs[:1]
+            for fn in pick:
+                add(os.path.join(folder, fn))
+            add(find_fast_gguf(folder))
+        elif name.endswith(".gguf"):
+            add(folder)
+    return found
+
+
+def template_for_gguf(gguf, transformers_dir):
+    """MiniCPM needs its HF chat template. Other GGUFs keep the template in the file."""
+    if "minicpm" not in os.path.basename(gguf).lower():
+        return None
+    cand = os.path.join(transformers_dir, "MiniCPM5-2B-NF4", "chat_template.jinja")
+    if os.path.isfile(cand):
+        return cand
+    return None
+
+
+def find_fast_gguf(model_path):
+    """Q4_K_M GGUF for the selected folder, or the MiniCPM sibling already on disk."""
+    if os.path.isdir(model_path):
+        ggufs = sorted(
+            os.path.join(model_path, name)
+            for name in os.listdir(model_path)
+            if name.endswith(".gguf")
+        )
+        if ggufs:
+            return ggufs[0]
+    base = os.path.basename(model_path.rstrip("/"))
+    if "minicpm5" not in base.lower():
+        return None
+    parent = os.path.dirname(model_path.rstrip("/"))
+    stem = base.replace("-NF4", "").replace("-nf4", "")
+    for cand in (
+        os.path.join(parent, stem + "-GGUF", stem + "-Q4_K_M.gguf"),
+        os.path.join(parent, "MiniCPM5-2B-GGUF", "MiniCPM5-2B-Q4_K_M.gguf"),
+    ):
+        if os.path.isfile(cand):
+            return cand
+    return None
+
+
+def llama_runtime_env():
+    """cuBLAS lives in the local extract; the driver CUDA libs stay on the system path."""
+    lib_dirs = [
+        os.path.join(ROOT, ".llama.cpp", "build", "bin"),
+        os.path.join(ROOT, ".cuda-extra", "usr", "local", "cuda-13.2", "targets", "sbsa-linux", "lib"),
+        "/usr/local/cuda/targets/sbsa-linux/lib",
+        "/usr/local/cuda/lib64",
+    ]
+    env = os.environ.copy()
+    prefix = ":".join(d for d in lib_dirs if os.path.isdir(d))
+    if prefix:
+        env["LD_LIBRARY_PATH"] = prefix + (
+            ":" + env["LD_LIBRARY_PATH"] if env.get("LD_LIBRARY_PATH") else ""
+        )
+    cuda_bin = "/usr/local/cuda/bin"
+    if os.path.isdir(cuda_bin):
+        env["PATH"] = cuda_bin + os.pathsep + env.get("PATH", "")
+    return env
+
+
+class _BackendNote:
+    def __init__(self, backend, gpu_note):
+        self.backend = backend
+        self.gpu_note = gpu_note
+
+
+class LlamaCppEngine:
+    """Chat loop driven by llama-completion in this process tree.
+
+    The model stays loaded. MiniTalk writes one line per turn and reads tokens
+    back. This is the fast Orin path (Q4_K_M, -ngl all). It is not llama-server.
+    """
+
+    # llama-completion prints this when it is waiting for the next user line.
+    _READY = "\n> "
+
+    def __init__(self, gguf, llama_bin, max_new, n_ctx=4096, prefer_gpu=True, model_window=None, template_path=None):
+        self.gguf = gguf
+        self.llama_bin = llama_bin
+        self.template_path = template_path
+        self.max_new = max_new
+        self.max_seq = n_ctx
+        self.model_window = model_window or n_ctx
+        self.prefer_gpu = prefer_gpu
+        self.temperature = 0.7
+        self.top_p = 0.9
+        self.repeat_penalty = 1.05
+        self.thinking = False
+        self.base_system = SYSTEM_PROMPT
+        self.facts = []
+        self.messages = [{"role": "system", "content": self._system_text()}]
+        self.proc = None
+        self._sampling = None
+        self.backend = "llama.cpp cuda" if prefer_gpu else "llama.cpp cpu"
+        self.gpu_note = os.path.basename(gguf)
+        self.start()
+
+    def _system_text(self):
+        parts = [self.base_system]
+        facts = getattr(self, "facts", None) or []
+        if facts:
+            parts.append("## Major facts (compacted)\n" + "\n".join(facts[-24:]))
+        # After a restart the child has no KV, so the recent turns ride along here.
+        # Guarded because __init__ calls this before messages/proc exist.
+        messages = getattr(self, "messages", None) or []
+        if getattr(self, "proc", None) is None and len(messages) > 1:
+            recent = [m for m in messages[1:] if m.get("content")]
+            if recent:
+                lines = [f"{m['role']}: {m['content']}" for m in recent]
+                parts.append("Recent talk:\n" + "\n".join(lines))
+        return "\n\n".join(parts)
+
+    def _window(self):
+        return max(64, int(self.max_seq))
+
+    def prompt_tokens(self):
+        # No HF tokenizer on the GGUF path. ~4 chars/token is enough for the compact trigger.
+        return sum(max(1, len(m.get("content", "")) // 4) for m in self.messages)
+
+    def _fact_token_budget(self, ratio):
+        return max(32, int(self._window() * ratio))
+
+    def _facts_tokens(self):
+        return max(1, len("\n".join(self.facts)) // 4) if self.facts else 0
+
+    def _trim_facts_to_budget(self, budget_tokens):
+        while self.facts and self._facts_tokens() > budget_tokens:
+            self.facts.pop(0)
+
+    def should_compact(self):
+        return self.prompt_tokens() >= int(self._window() * COMPACT_TRIGGER_RATIO)
+
+    def _rebuild_system(self):
+        self.messages[0] = {"role": "system", "content": self.base_system if not self.facts else self._system_text_live()}
+
+    def _system_text_live(self):
+        if not self.facts:
+            return self.base_system
+        return f"{self.base_system}\n\n## Major facts (compacted)\n" + "\n".join(self.facts[-24:])
+
+    def set_system(self, text):
+        self.base_system = text.strip() or SYSTEM_PROMPT
+        self._rebuild_system()
+        self.restart()
+
+    def clear(self):
+        self.messages = [{"role": "system", "content": self._system_text_live()}]
+        self.restart()
+
+    def new_chat(self):
+        self.facts = []
+        self.messages = [{"role": "system", "content": self.base_system}]
+        self.restart()
+
+    def compact(self, keep_recent=COMPACT_KEEP_RECENT, force=False):
+        if len(self.messages) <= 1 + keep_recent and not force:
+            return "nothing to compact"
+        older = self.messages[1:-keep_recent] if keep_recent else self.messages[1:]
+        recent = self.messages[-keep_recent:] if keep_recent else []
+        if not older and not force:
+            return "nothing to compact"
+        added = 0
+        for msg in older:
+            role = msg.get("role", "")
+            content = msg.get("content", "")
+            if role not in ("user", "assistant") or not content:
+                continue
+            for line in _fact_lines_from_text(role, content, limit=2):
+                if line not in self.facts:
+                    self.facts.append(line)
+                    added += 1
+        used_ratio = COMPACT_BUDGET_RATIOS[0]
+        for ratio in COMPACT_BUDGET_RATIOS:
+            used_ratio = ratio
+            self._trim_facts_to_budget(self._fact_token_budget(ratio))
+            self.messages = [{"role": "system", "content": self._system_text_live()}] + recent
+            if self.prompt_tokens() < int(self._window() * COMPACT_TRIGGER_RATIO):
+                break
+        # Child KV still holds the old turns. Restart so the next line sees facts + recent talk only.
+        self.restart()
+        return (
+            f"compacted +{added} · past≤{int(used_ratio * 100)}% window "
+            f"({self._facts_tokens()} tok) · kept {len(recent)} turns · {len(self.facts)} facts"
+        )
+
+    def close(self):
+        proc = self.proc
+        self.proc = None
+        if proc is None:
+            return
+        try:
+            if proc.stdin:
+                proc.stdin.close()
+        except Exception:
+            pass
+        try:
+            proc.wait(timeout=2)
+        except Exception:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+        err = getattr(self, "_err", None)
+        if err is not None:
+            try:
+                err.close()
+            except Exception:
+                pass
+            self._err = None
+
+    def start(self):
+        self.close()
+        # _system_text includes recent turns only while proc is None (just closed).
+        system = self._system_text()
+        self.messages[0] = {"role": "system", "content": system}
+        log_path = os.path.join(ROOT, ".llama-cpp.log")
+        cmd = [
+            "stdbuf", "-o0", "-e0",
+            self.llama_bin,
+            "-m", self.gguf,
+            "-ngl", "all" if self.prefer_gpu else "0",
+            "-c", str(self.max_seq),
+            "-n", str(self.max_new),
+            "-t", "6",
+            "-b", "512",
+            "-ub", "256",
+            "--jinja",
+            "--reasoning", "on" if self.thinking else "off",
+            "-sys", system,
+            "--simple-io",
+            "--no-display-prompt",
+            "--color", "off",
+            "--no-warmup",
+            "--fit", "off",
+            "-fa", "off",
+            "--temp", f"{self.temperature}",
+            "--top-p", f"{self.top_p}",
+            "--min-p", "0",
+            "--repeat-penalty", f"{self.repeat_penalty}",
+            "-i", "-if",
+            "-lv", "1",
+            "--log-file", log_path,
+        ]
+        if self.template_path and os.path.isfile(self.template_path):
+            # HF template honors enable_thinking (set by --reasoning off).
+            cmd[cmd.index("--jinja") + 1:cmd.index("--jinja") + 1] = [
+                "--chat-template-file", self.template_path,
+            ]
+        self._sampling = (self.temperature, self.top_p, self.repeat_penalty, self.max_new, self.thinking, system)
+        err_path = os.path.join(ROOT, ".llama-cpp.err")
+        self._err = open(err_path, "wb")
+        self.proc = subprocess.Popen(
+            cmd,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=self._err,
+            env=llama_runtime_env(),
+            bufsize=0,
+            start_new_session=True,
+        )
+        # Block until the model is resident and the prompt is up.
+        self._read_until_ready(timeout=180, on_token=None, stop=None)
+
+    def restart(self):
+        self.start()
+
+    def use_model(self, gguf, template_path=None):
+        """Load another GGUF. Messages and facts stay; the child is restarted with them."""
+        old_gguf = self.gguf
+        old_template = self.template_path
+        self.gguf = gguf
+        self.template_path = template_path
+        try:
+            self.restart()
+        except Exception:
+            self.gguf = old_gguf
+            self.template_path = old_template
+            try:
+                self.restart()
+            except Exception:
+                pass
+            raise
+        self.gpu_note = os.path.basename(gguf)
+
+    def _ensure_sampling(self):
+        current = (self.temperature, self.top_p, self.repeat_penalty, self.max_new, self.thinking, self.messages[0]["content"])
+        if current != self._sampling:
+            self.restart()
+
+    def _read_until_ready(self, timeout, on_token, stop):
+        import select
+        import signal
+
+        proc = self.proc
+        acc = bytearray()
+        deadline = time.perf_counter() + timeout
+        sent_stop = False
+        while time.perf_counter() < deadline:
+            if stop is not None and stop.is_set() and not sent_stop:
+                try:
+                    os.kill(proc.pid, signal.SIGINT)
+                except OSError:
+                    pass
+                sent_stop = True
+            if proc.poll() is not None:
+                err = acc.decode("utf-8", errors="replace")[-800:]
+                tail = ""
+                err_path = os.path.join(ROOT, ".llama-cpp.err")
+                try:
+                    with open(err_path, "r", encoding="utf-8", errors="replace") as handle:
+                        tail = handle.read()[-600:]
+                except OSError:
+                    pass
+                raise RuntimeError(f"llama.cpp exited {proc.returncode}: {tail or err}")
+            ready, _, _ = select.select([proc.stdout], [], [], 0.15)
+            if not ready:
+                continue
+            chunk = os.read(proc.stdout.fileno(), 4096)
+            if not chunk:
+                raise RuntimeError("llama.cpp closed stdout")
+            acc.extend(chunk)
+            text = acc.decode("utf-8", errors="replace")
+            if self._READY in text:
+                body = text.rsplit(self._READY, 1)[0]
+                return body.strip()
+            if on_token and text.strip():
+                on_token(text.strip())
+        raise TimeoutError("llama.cpp did not become ready")
+
+    def _one_line(self, user_text):
+        # readline_simple treats a trailing \ or / as a control character.
+        line = " ".join(user_text.split())
+        if not line:
+            line = "."
+        if line.endswith("\\") or line.endswith("/"):
+            line += " "
+        return line
+
+    def reply(self, user_text, on_token=None, on_status=None, stop=None):
+        # Restart (sampling change or compact) before the new line is part of history,
+        # so the child sees that line once.
+        if self.should_compact():
+            note = self.compact()
+            if on_status:
+                on_status(note)
+        else:
+            self._ensure_sampling()
+        self.messages.append({"role": "user", "content": user_text})
+        if on_status:
+            on_status("prefill")
+        try:
+            self.proc.stdin.write((self._one_line(user_text) + "\n").encode("utf-8"))
+            self.proc.stdin.flush()
+        except Exception as exc:
+            self.messages.pop()
+            raise RuntimeError(f"could not talk to llama.cpp: {exc}") from exc
+        t0 = time.perf_counter()
+
+        def _tok(partial):
+            if on_token:
+                on_token(partial)
+            if on_status:
+                elapsed = time.perf_counter() - t0
+                # chars/4 until the child prints a timing; good enough for the sparkline.
+                rate = (len(partial) / 4) / elapsed if elapsed > 0.2 else 0.0
+                if rate:
+                    on_status(f"{int(len(partial)/4)} tok · {rate:.2f} tok/s · rss {rss_mb()}MB")
+
+        try:
+            text = self._read_until_ready(timeout=180, on_token=_tok, stop=stop)
+        except Exception:
+            self.messages.pop()
+            raise
+        text = (text or "").strip()
+        if not text:
+            self.messages.pop()
+            return ""
+        self.messages.append({"role": "assistant", "content": text})
+        # Leave the last tok/s line on the HUD. Do not replace it with "done".
+        return text
+
+
+def make_engine(model_path, max_seq, max_new, prefer_gpu=True, model_window=None, on_status=None):
+    """Prefer the llama.cpp CUDA build when the GGUF and binary are both present."""
+    gguf = find_fast_gguf(model_path)
+    llama_bin = find_llama_bin()
+    if gguf and llama_bin:
+        if on_status:
+            on_status("loading llama.cpp")
+        # Cap the llama.cpp context. The NF4 clamp (often 8192) made prefill crawl.
+        n_ctx = min(max_seq or 4096, 4096)
+        template_path = os.path.join(model_path, "chat_template.jinja")
+        engine = LlamaCppEngine(
+            gguf,
+            llama_bin,
+            max_new,
+            n_ctx=n_ctx,
+            prefer_gpu=prefer_gpu,
+            model_window=model_window,
+            template_path=template_path if os.path.isfile(template_path) else None,
+        )
+        note = _BackendNote(engine.backend, f"{engine.gpu_note} · ngl {'all' if prefer_gpu else '0'}")
+        return engine, note
+    if on_status:
+        on_status("loading NF4")
+    kn = kernel(prefer_gpu=prefer_gpu)
+    model = MiniCPM(model_path, max_seq, progress=lambda _p, detail: on_status and on_status(f"load {detail}"))
+    tokenizer, template = load_tokenizer(model_path)
+    engine = ChatEngine(model, tokenizer, template, max_new)
+    return engine, kn
+
+
 def run_once(model_path, max_seq, max_new, temperature, prompt, prefer_gpu=True):
     def status(message):
         print(f"\r{message:<48}", end="", file=sys.stderr, flush=True)
 
-    kn = kernel(prefer_gpu=prefer_gpu)
+    engine, kn = make_engine(model_path, max_seq, max_new, prefer_gpu=prefer_gpu, on_status=status)
     print(f"backend {kn.backend}: {kn.gpu_note or 'CPU NEON'}", file=sys.stderr)
-    print("loading", model_path, file=sys.stderr)
-    model = MiniCPM(model_path, max_seq, progress=lambda _p, detail: status(f"load {detail}"))
-    tokenizer, template = load_tokenizer(model_path)
-    engine = ChatEngine(model, tokenizer, template, max_new)
     engine.temperature = temperature
 
     def on_token(text):
@@ -1032,6 +1485,7 @@ def run_tui(model_path, max_seq, max_new, model_window=None, prefer_gpu=True):
         def __init__(self, model_path, max_seq, max_new, model_window=None, prefer_gpu=True):
             super().__init__()
             self.model_path = model_path
+            self.transformers_dir = os.path.dirname(os.path.abspath(model_path))
             self.max_seq = max_seq
             self.model_window = model_window or max_seq
             self.max_new = max_new
@@ -1061,7 +1515,7 @@ def run_tui(model_path, max_seq, max_new, model_window=None, prefer_gpu=True):
                     Text.assemble(
                         ("MiniTalk\n", "bold cyan"),
                         "For NVIDIA Jetson Orin Nano Super — 8 GB unified memory.\n",
-                        "Run from a terminal. Weights stay mapped; GPU used when CUDA inits.\n",
+                        "Run from a terminal. Fast path is llama.cpp on the Orin GPU (GGUF).\n",
                         (
                             f"Model window {self.model_window} · working KV {self.max_seq} · "
                             f"RAM free {avail}/{total} MB\n",
@@ -1116,13 +1570,17 @@ def run_tui(model_path, max_seq, max_new, model_window=None, prefer_gpu=True):
         @work(thread=True, exclusive=True, group="load", exit_on_error=False)
         def _load(self):
             try:
-                def progress(_phase, detail):
-                    self.app.call_from_thread(self._set_hud, f"load {detail}")
+                def progress(detail):
+                    self.app.call_from_thread(self._set_hud, detail)
 
-                kn = kernel(prefer_gpu=self.prefer_gpu)
-                model = MiniCPM(self.model_path, self.max_seq, progress=progress)
-                tokenizer, template = load_tokenizer(self.model_path)
-                engine = ChatEngine(model, tokenizer, template, self.max_new)
+                engine, kn = make_engine(
+                    self.model_path,
+                    self.max_seq,
+                    self.max_new,
+                    prefer_gpu=self.prefer_gpu,
+                    model_window=self.model_window,
+                    on_status=progress,
+                )
                 self.app.call_from_thread(self._loaded, engine, kn)
             except Exception:
                 self.app.call_from_thread(self._fail, traceback.format_exc())
@@ -1130,7 +1588,10 @@ def run_tui(model_path, max_seq, max_new, model_window=None, prefer_gpu=True):
         def _loaded(self, engine, kn):
             self.engine = engine
             self.backend = kn.backend
-            self.model_window = getattr(engine.model, "model_window", self.model_window)
+            self.max_seq = getattr(engine, "max_seq", self.max_seq)
+            self.model_window = getattr(engine, "model_window", None) or getattr(
+                getattr(engine, "model", None), "model_window", self.model_window
+            )
             note = kn.gpu_note or "CPU NEON+OpenMP"
             self._set_hud("ready")
             self.query_one("#transcript", RichLog).write(
@@ -1183,6 +1644,8 @@ def run_tui(model_path, max_seq, max_new, model_window=None, prefer_gpu=True):
                         "/sys TEXT       replace the system prompt\n"
                         "/quit           leave\n"
                         "Esc             stop the current reply\n"
+                        "/models         list models you can switch to\n"
+                        "/model 2        switch to that number, keep this chat\n"
                         "\n"
                         "Auto-compact near 70% of the working KV window.\n"
                         "Past history is kept at ~10% of the window, then 5%\n"
@@ -1244,7 +1707,89 @@ def run_tui(model_path, max_seq, max_new, model_window=None, prefer_gpu=True):
                 self.engine.set_system(arg)
                 log.write(Text("System prompt updated.", style="yellow"))
                 return
+            if name in ("/models", "/model") and not arg:
+                self._show_models()
+                return
+            if name == "/model" and arg:
+                self._switch_model(arg)
+                return
             log.write(Text(f"Unknown command {name}. Try /help.", style="red"))
+
+        def _show_models(self):
+            models = list_switchable_models(self.transformers_dir)
+            self._model_choices = models
+            current = os.path.abspath(getattr(self.engine, "gguf", "") or "")
+            lines = []
+            for i, item in enumerate(models, 1):
+                mark = "  now" if os.path.abspath(item["gguf"]) == current else ""
+                lines.append(f"[{i}] {item['name']}  {item['size_gb']:.2f}GB{mark}")
+            if not lines:
+                lines.append(f"No GGUF files in {self.transformers_dir}")
+            else:
+                lines.append("")
+                lines.append("/model NUMBER switches and keeps this chat.")
+            self.query_one("#transcript", RichLog).write(
+                Panel("\n".join(lines), title="models", border_style="cyan")
+            )
+
+        def _switch_model(self, arg):
+            if self.busy:
+                self._set_hud("still working — Esc stops")
+                return
+            models = list_switchable_models(self.transformers_dir)
+            self._model_choices = models
+            if not models:
+                self._set_hud("no GGUF models found")
+                return
+            choice = None
+            if arg.isdigit() and 1 <= int(arg) <= len(models):
+                choice = models[int(arg) - 1]
+            else:
+                key = arg.lower()
+                hits = [m for m in models if key in m["name"].lower()]
+                if len(hits) == 1:
+                    choice = hits[0]
+            if choice is None:
+                self.query_one("#transcript", RichLog).write(
+                    Text(f"No model {arg}. Use /models.", style="red")
+                )
+                return
+            current = os.path.abspath(getattr(self.engine, "gguf", "") or "")
+            if os.path.abspath(choice["gguf"]) == current:
+                self._set_hud(f"already {choice['name']}")
+                return
+            if not hasattr(self.engine, "use_model"):
+                self._set_hud("this engine cannot switch")
+                return
+            self.busy = True
+            self._set_hud(f"switching to {choice['name']}")
+            self.query_one("#transcript", RichLog).write(
+                Text(f"Switching to {choice['name']}. Keeping this chat.", style="yellow")
+            )
+            self._switch_worker(choice)
+
+        @work(thread=True, exclusive=True, group="switch", exit_on_error=False)
+        def _switch_worker(self, choice):
+            try:
+                self.engine.use_model(choice["gguf"], choice.get("template"))
+                self.app.call_from_thread(self._switched, choice["name"])
+            except Exception:
+                self.app.call_from_thread(self._switch_failed, traceback.format_exc())
+
+        def _switched(self, name):
+            self.busy = False
+            self.backend = getattr(self.engine, "backend", self.backend)
+            self.query_one("#transcript", RichLog).write(
+                Text(f"Now {name}. This chat is kept.", style="green")
+            )
+            self._set_hud(f"model {name}")
+
+        def _switch_failed(self, message):
+            self.busy = False
+            self.query_one("#transcript", RichLog).write(
+                Panel(message, title="switch failed", border_style="red")
+            )
+            self._set_hud("switch failed")
 
         def action_new(self):
             if self.busy:
@@ -1326,7 +1871,7 @@ def run_tui(model_path, max_seq, max_new, model_window=None, prefer_gpu=True):
             self.query_one("#transcript", RichLog).write(
                 Panel(body, title="minicpm", border_style="green", title_align="left")
             )
-            self._set_hud("ready")
+            # Keep the last tok/s (and the sparkline) visible after the reply.
 
         def _finish_error(self, message):
             self.busy = False

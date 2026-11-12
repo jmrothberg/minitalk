@@ -2,7 +2,7 @@
 
 **Terminal chatbot for [NVIDIA Jetson Orin Nano Super](https://www.nvidia.com/en-us/autonomous-machines/embedded-systems/jetson-orin/) (8 GB unified memory).**
 
-MiniTalk is built for boards where CPU, GPU, and the desktop all share one small RAM pool. It runs from a **plain terminal**, memory-maps NF4 weights from disk, uses the **Orin CUDA GPU** when the driver can JIT the NF4 kernel, and falls back to ARM NEON + OpenMP.
+MiniTalk is built for boards where CPU, GPU, and the desktop all share one small RAM pool. It runs from a **plain terminal**. The fast runtime is llama.cpp on the Orin CUDA GPU with a Q4_K_M GGUF. If that build is not present it falls back to a memory-mapped NF4 kernel (much slower).
 
 > Default model folder layout: put Hugging Face–style dumps under `~/Transformers/` (or set `MINITALK_TRANSFORMERS`). At startup MiniTalk lists them and you pick by number.
 
@@ -85,6 +85,8 @@ Local Python deps live in `.pydeps/` (tokenizers, textual). `minitalk.py` adds t
 | `/help` `/quit` | Help / exit |
 | `Esc` | Stop generation |
 
+`/models` lists the GGUF files under the Transformers directory. `/model 2` loads that one and keeps the current chat (turns and compacted facts). You do not have to quit.
+
 ## Compaction (5% / 10%)
 
 Inspired by long-horizon compaction work (e.g. relevance-filtered history at ~**5%** matching full-history quality — [arXiv:2610.14952](https://arxiv.org/abs/2610.14952); early trigger + keep recent turns — Bud ContextCompact / CompactionBench):
@@ -105,6 +107,12 @@ MiniTalk reads, in order:
 If none are present, it assumes **256k** (`262144`). The **working KV** is then clamped from free RAM so the Orin does not OOM.
 
 ## GPU (Orin CUDA)
+
+The fast path is **llama.cpp** in this same program (not a server). If `.llama.cpp/build/bin/llama-completion` exists and a Q4_K_M GGUF is next to the model (`MiniCPM5-2B-GGUF/MiniCPM5-2B-Q4_K_M.gguf`), MiniTalk loads that on the Orin GPU (`-ngl all`, context capped at 4096) and the HUD says `llama.cpp cuda`. That is the speed you want on this 2B model.
+
+The built-in NF4 kernel is the fallback when that binary is missing. It is correct but about 1 tok/s: prefill is CPU, and a large working KV (the 8GB clamp, often 8192) makes the first reply look stuck on `prefill 33/42`.
+
+## NF4 fallback details
 
 On startup MiniTalk tries:
 

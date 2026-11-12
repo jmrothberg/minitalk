@@ -5,6 +5,11 @@ __pycache__/
 *.so
 .cuda_debs/
 .cuda_local/
+.debs/
+.cuda-extra/
+.llama.cpp/
+.llama-cpp.log
+.llama-cpp.err
 *.egg-info/
 .DS_Store
 .idea/
